@@ -1,0 +1,299 @@
+import React, { useEffect, useRef, useState } from "react";
+
+// Chess Analyzer Component
+// - Interface inspirée d'une messagerie (chat-like)
+// - Permet d'entrer une position (FEN) ou une séquence de coups
+// - Utilise Stockfish côté client via un WebWorker (vous devez fournir stockfish.wasm/js)
+// - Affiche l'évaluation, le meilleur coup et un aperçu du plateau
+// - Stylé avec Tailwind (assurez-vous que Tailwind est configuré)
+
+// Dépendances recommandées (installer via npm/yarn):
+// - react, react-dom
+// - chess.js (pour validation et génération de FEN depuis les coups)
+// - stockfish (ou votre build wasm/js de Stockfish placé dans /public)
+// - optional: @lottiefiles/react-lottie-player, shadcn/ui
+
+// Instructions rapides:
+// 1) Placer un build de Stockfish (par ex. stockfish.wasm.js + stockfish.wasm) dans /public et
+//    adapter le chemin WORKER_SRC ci-dessous si nécessaire.
+// 2) Installer chess.js: `npm install chess.js`
+// 3) Intégrer ce composant dans votre app (par ex. pages/index.jsx ou App.jsx)
+
+const WORKER_SRC = "/stockfish.js"; // chemin vers votre build Stockfish (web worker-friendly)
+
+export default function ChessAnalyzer() {
+  const [messages, setMessages] = useState([
+    { role: "assistant", text: "Prêt. Donne une position (FEN) ou une liste de coups (ex: e4 e5 Nf3)" },
+  ]);
+  const [input, setInput] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [fenPreview, setFenPreview] = useState("");
+  const workerRef = useRef(null);
+  const chessRef = useRef(null);
+
+  useEffect(() => {
+    // lazy import chess.js (works in modern bundlers)
+    import("chess.js").then((mod) => {
+      // chess.js exports Chess differently depending on version
+      const Chess = mod.Chess || mod.default || mod;
+      chessRef.current = new Chess();
+    });
+
+    // init worker
+    if (typeof Worker !== "undefined") {
+      try {
+        workerRef.current = new Worker(WORKER_SRC);
+        workerRef.current.onmessage = handleWorkerMessage;
+        // Basic engine setup
+        workerRef.current.postMessage("uci");
+      } catch (e) {
+        console.error("Erreur lors de l'initialisation du worker Stockfish:", e);
+      }
+    }
+
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleWorkerMessage(event) {
+    const data = event?.data;
+    if (!data) return;
+
+    // Forward raw engine output to chat-like area
+    appendMessage({ role: "assistant", text: `[engine] ${String(data)}` });
+  }
+
+  function appendMessage(msg) {
+    setMessages((m) => [...m, msg]);
+  }
+
+  async function handleAnalyze(raw) {
+    const text = raw.trim();
+    if (!text) return;
+
+    appendMessage({ role: "user", text });
+    setInput("");
+
+    // determine if input is FEN or moves
+    const chess = chessRef.current;
+    if (!chess) {
+      appendMessage({ role: "assistant", text: "Impossible d'utiliser chess.js pour l'instant." });
+      return;
+    }
+
+    setAnalyzing(true);
+
+    // Try to detect FEN (6 fields separated by spaces and contains 'w' or 'b')
+    const isFEN = text.split(" ").length >= 6 && / [wb] /.test(` ${text} `);
+
+    try {
+      if (isFEN) {
+        chess.load(text);
+        setFenPreview(chess.fen());
+      } else {
+        // treat as moves list
+        chess.reset();
+        const moves = text.split(/\s+/);
+        for (const m of moves) {
+          const ok = chess.move(m, { sloppy: true });
+          if (!ok) {
+            appendMessage({ role: "assistant", text: `Couple invalide : "${m}" — arrêt.` });
+            setAnalyzing(false);
+            return;
+          }
+        }
+        setFenPreview(chess.fen());
+      }
+
+      // Send position to engine
+      const fen = chess.fen();
+      appendMessage({ role: "assistant", text: `Position chargée: ${fen}` });
+
+      if (!workerRef.current) {
+        appendMessage({ role: "assistant", text: "Moteur non disponible (worker manquant)." });
+        setAnalyzing(false);
+        return;
+      }
+
+      // Ask engine to analyze for a short time and return best move + eval
+      // We'll send UCI commands to Stockfish
+      workerRef.current.postMessage(`position fen ${fen}`);
+      workerRef.current.postMessage("go depth 16");
+
+      // The engine will stream info lines; we'll capture them via the worker onmessage
+      appendMessage({ role: "assistant", text: "Analyse en cours (profondeur 16)..." });
+    } catch (err) {
+      console.error(err);
+      appendMessage({ role: "assistant", text: "Erreur lors du traitement de la position." });
+    } finally {
+      // note: we keep analyzing true until the engine returns info/bestmove.
+      // we'll setAnalyzing(false) when receiving 'bestmove' from the worker.
+    }
+  }
+
+  // Simple UI to render a minimal chessboard (svg 8x8). Not a full-featured board.
+  function Board({ fen }) {
+    // parse fen to array
+    if (!fen) return <div className="p-4 text-sm text-gray-500">Aucune position</div>;
+    const [piecePlacement] = fen.split(" ");
+    const ranks = piecePlacement.split("/");
+
+    const pieceMap = {
+      p: "p",
+      r: "r",
+      n: "n",
+      b: "b",
+      q: "q",
+      k: "k",
+      P: "P",
+      R: "R",
+      N: "N",
+      B: "B",
+      Q: "Q",
+      K: "K",
+    };
+
+    const cells = [];
+    for (let r = 0; r < 8; r++) {
+      const row = ranks[r];
+      let file = 0;
+      for (const ch of row) {
+        if (/[1-8]/.test(ch)) {
+          const empty = parseInt(ch, 10);
+          for (let i = 0; i < empty; i++) {
+            cells.push({ piece: null });
+            file++;
+          }
+        } else {
+          cells.push({ piece: pieceMap[ch] });
+          file++;
+        }
+      }
+    }
+
+    return (
+      <div className="w-64 h-64 grid grid-cols-8 grid-rows-8 border-2 rounded-lg overflow-hidden">
+        {cells.map((c, i) => {
+          const row = Math.floor(i / 8);
+          const col = i % 8;
+          const dark = (row + col) % 2 === 1;
+          return (
+            <div key={i} className={`w-full h-full flex items-center justify-center ${dark ? 'bg-gray-700' : 'bg-gray-200'}`}>
+              <span className="text-2xl font-semibold">{renderPiece(c.piece)}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderPiece(p) {
+    if (!p) return "\u00A0";
+    // Use simple Unicode pieces
+    const map = {
+      p: "♟",
+      r: "♜",
+      n: "♞",
+      b: "♝",
+      q: "♛",
+      k: "♚",
+      P: "♙",
+      R: "♖",
+      N: "♘",
+      B: "♗",
+      Q: "♕",
+      K: "♔",
+    };
+    return map[p] || "?";
+  }
+
+  // Listen for 'bestmove' to stop analyzing
+  useEffect(() => {
+    if (!workerRef.current) return;
+    const handler = (e) => {
+      const text = String(e.data);
+      // detect bestmove line
+      if (text.startsWith("bestmove")) {
+        appendMessage({ role: "assistant", text: `Résultat du moteur: ${text}` });
+        setAnalyzing(false);
+      } else if (text.startsWith("info")) {
+        // show engine info
+        appendMessage({ role: "assistant", text: text });
+      }
+    };
+    workerRef.current.addEventListener("message", handler);
+    return () => workerRef.current?.removeEventListener("message", handler);
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 text-white p-6">
+      <div className="max-w-5xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-6">
+        {/* Left: Chat-like area */}
+        <div className="md:col-span-2 bg-gray-900 rounded-2xl p-4 shadow-lg">
+          <div className="flex items-center justify-between mb-4">
+            <h1 className="text-xl font-bold">Analyseur d'échecs (client)</h1>
+            <div className="text-sm text-gray-400">Engine: Stockfish (local)</div>
+          </div>
+
+          <div className="space-y-3 max-h-[60vh] overflow-auto p-2">
+            {messages.map((m, i) => (
+              <div key={i} className={`rounded-lg p-3 ${m.role === 'user' ? 'bg-blue-600 self-end' : 'bg-gray-800'}`}>
+                <div className="text-sm whitespace-pre-wrap">{m.text}</div>
+              </div>
+            ))}
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleAnalyze(input);
+            }}
+            className="mt-4 flex gap-2"
+          >
+            <input
+              className="flex-1 rounded-lg px-3 py-2 bg-gray-800 border border-gray-700 placeholder:text-gray-400"
+              placeholder="FEN ou coups (ex: e4 e5 Nf3)..."
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+            />
+            <button
+              type="submit"
+              disabled={analyzing}
+              className="px-4 py-2 rounded-lg bg-indigo-600 disabled:opacity-50"
+            >
+              {analyzing ? "Analyse..." : "Analyser"}
+            </button>
+          </form>
+
+          <div className="mt-3 text-sm text-gray-400">Astuce: vous pouvez entrer un FEN complet ou une suite de coups séparés par des espaces.</div>
+        </div>
+
+        {/* Right: Board + engine controls */}
+        <div className="bg-gray-900 rounded-2xl p-4 shadow-lg flex flex-col items-center gap-4">
+          <h2 className="text-lg font-semibold">Aperçu du plateau</h2>
+          <Board fen={fenPreview} />
+
+          <div className="w-full">
+            <button
+              className="w-full px-3 py-2 rounded-lg bg-green-600"
+              onClick={() => {
+                // quick demo: starting position
+                const startFen = "rn1qkbnr/ppp2ppp/3b4/3pp3/4P3/2N1BN2/PPPP1PPP/R1BQK2R w KQkq - 0 6";
+                setInput(startFen);
+              }}
+            >
+              Charger exemple
+            </button>
+
+            <div className="mt-2 text-xs text-gray-400">Vous devez fournir stockfish.js dans /public ou modifier WORKER_SRC.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
